@@ -81,9 +81,19 @@ def generate(
     cfg_normalization: bool = False,
     cfg_truncation: float = DEFAULT_CFG_TRUNCATION,
     max_sequence_length: int = DEFAULT_MAX_SEQUENCE_LENGTH,
-    output_type: str = "pil",
+    device: Optional[Union[str, torch.device]] = None,
+    sequential_offload: bool = False,
+    force_text_encoder_cpu: bool = False,
 ):
-    device = next(transformer.parameters()).device
+    if device is None:
+        device = next(transformer.parameters()).device
+    
+    if sequential_offload:
+        import gc
+        def cleanup():
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     if hasattr(vae, "config") and hasattr(vae.config, "block_out_channels"):
         vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
@@ -124,8 +134,16 @@ def generate(
         return_tensors="pt",
     )
 
-    text_input_ids = text_inputs.input_ids.to(device)
-    prompt_masks = text_inputs.attention_mask.to(device).bool()
+    te_device = device
+    if force_text_encoder_cpu:
+        te_device = "cpu"
+
+    text_input_ids = text_inputs.input_ids.to(te_device)
+    prompt_masks = text_inputs.attention_mask.to(te_device).bool()
+
+    if sequential_offload and not force_text_encoder_cpu:
+        logger.info("Moving text_encoder to GPU...")
+        text_encoder.to(device)
 
     prompt_embeds = text_encoder(
         input_ids=text_input_ids,
@@ -163,8 +181,8 @@ def generate(
             return_tensors="pt",
         )
 
-        neg_input_ids = neg_inputs.input_ids.to(device)
-        neg_masks = neg_inputs.attention_mask.to(device).bool()
+        neg_input_ids = neg_inputs.input_ids.to(te_device)
+        neg_masks = neg_inputs.attention_mask.to(te_device).bool()
 
         neg_embeds = text_encoder(
             input_ids=neg_input_ids,
@@ -174,6 +192,11 @@ def generate(
 
         for i in range(len(neg_embeds)):
             negative_prompt_embeds_list.append(neg_embeds[i][neg_masks[i]])
+
+    if sequential_offload and not force_text_encoder_cpu:
+        logger.info("Moving text_encoder back to CPU...")
+        text_encoder.to("cpu")
+        cleanup()
 
     if num_images_per_prompt > 1:
         prompt_embeds_list = [pe for pe in prompt_embeds_list for _ in range(num_images_per_prompt)]
@@ -212,6 +235,11 @@ def generate(
 
     from tqdm import tqdm
 
+    # Transformer offloading handled inside transformer forward if sequential_offload is True
+    # if sequential_offload:
+    #     logger.info("Moving transformer to GPU...")
+    #     transformer.to(device)
+
     # Denoising loop with progress bar
     for i, t in enumerate(tqdm(timesteps, desc="Denoising", total=len(timesteps))):
         # If current t is 0 and it's the last step, skip computation
@@ -249,6 +277,8 @@ def generate(
             latent_model_input_list,
             timestep_model_input,
             prompt_embeds_model_input,
+            offload_layers=sequential_offload,
+            target_device=device,
         )[0]
 
         if apply_cfg:
@@ -275,12 +305,26 @@ def generate(
         latents = scheduler.step(noise_pred.to(torch.float32), t, latents, return_dict=False)[0]
         assert latents.dtype == torch.float32
 
+    # if sequential_offload:
+    #     logger.info("Moving transformer back to CPU...")
+    #     transformer.to("cpu")
+    #     cleanup()
+
     if output_type == "latent":
         return latents
+
+    if sequential_offload:
+        logger.info("Moving vae to GPU...")
+        vae.to(device)
 
     shift_factor = getattr(vae.config, "shift_factor", 0.0) or 0.0
     latents = (latents.to(vae.dtype) / vae.config.scaling_factor) + shift_factor
     image = vae.decode(latents, return_dict=False)[0]
+
+    if sequential_offload:
+        logger.info("Moving vae back to CPU...")
+        vae.to("cpu")
+        cleanup()
 
     if output_type == "pil":
         from PIL import Image

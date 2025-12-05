@@ -1,7 +1,7 @@
 """Z-Image Transformer."""
 
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -478,14 +478,29 @@ class ZImageTransformer2DModel(nn.Module):
         cap_feats: List[torch.Tensor],
         patch_size=2,
         f_patch_size=1,
+        offload_layers: bool = False,
+        target_device: Optional[Union[str, torch.device]] = None,
     ):
         assert patch_size in self.all_patch_size
         assert f_patch_size in self.all_f_patch_size
 
         bsz = len(x)
-        device = x[0].device
+        # If offloading, x might be on CPU initially, but we want to use target_device for compute
+        if offload_layers and target_device is not None:
+            device = target_device
+        else:
+            device = x[0].device
+            
         t = t * self.t_scale
-        t = self.t_embedder(t)
+        
+        # t_embedder needs to be on device
+        if offload_layers and target_device is not None:
+            self.t_embedder.to(device)
+            
+        t = self.t_embedder(t.to(device))
+        
+        if offload_layers and target_device is not None:
+            self.t_embedder.to("cpu")
 
         (
             x,
@@ -501,13 +516,25 @@ class ZImageTransformer2DModel(nn.Module):
         assert all(_ % SEQ_MULTI_OF == 0 for _ in x_item_seqlens)
         x_max_item_seqlen = max(x_item_seqlens)
 
-        x = torch.cat(x, dim=0)
-        x = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)
+        x = torch.cat(x, dim=0).to(device)
+        
+        # Embedder
+        embedder_key = f"{patch_size}-{f_patch_size}"
+        if offload_layers and target_device is not None:
+            self.all_x_embedder[embedder_key].to(device)
+            
+        x = self.all_x_embedder[embedder_key](x)
+        
+        if offload_layers and target_device is not None:
+            self.all_x_embedder[embedder_key].to("cpu")
 
         adaln_input = t.type_as(x)
-        x[torch.cat(x_inner_pad_mask)] = self.x_pad_token
+        x[torch.cat(x_inner_pad_mask).to(device)] = self.x_pad_token.to(device)
         x = list(x.split(x_item_seqlens, dim=0))
-        x_freqs_cis = list(self.rope_embedder(torch.cat(x_pos_ids, dim=0)).split([len(_) for _ in x_pos_ids], dim=0))
+        
+        # Rope embedder
+        rope_ids = torch.cat(x_pos_ids, dim=0).to(device)
+        x_freqs_cis = list(self.rope_embedder(rope_ids).split([len(_) for _ in x_pos_ids], dim=0))
 
         x = pad_sequence(x, batch_first=True, padding_value=0.0)
         x_freqs_cis = pad_sequence(x_freqs_cis, batch_first=True, padding_value=0.0)
@@ -519,18 +546,33 @@ class ZImageTransformer2DModel(nn.Module):
             x_attn_mask[i, :seq_len] = 1
 
         for layer in self.noise_refiner:
+            if offload_layers and target_device is not None:
+                layer.to(device)
             x = layer(x, x_attn_mask, x_freqs_cis, adaln_input)
+            if offload_layers and target_device is not None:
+                layer.to("cpu")
+                # torch.cuda.empty_cache()
 
         cap_item_seqlens = [len(_) for _ in cap_feats]
         assert all(_ % SEQ_MULTI_OF == 0 for _ in cap_item_seqlens)
         cap_max_item_seqlen = max(cap_item_seqlens)
 
-        cap_feats = torch.cat(cap_feats, dim=0)
+        cap_feats = torch.cat(cap_feats, dim=0).to(device)
+        
+        if offload_layers and target_device is not None:
+            self.cap_embedder.to(device)
+            
         cap_feats = self.cap_embedder(cap_feats)
-        cap_feats[torch.cat(cap_inner_pad_mask)] = self.cap_pad_token
+        
+        if offload_layers and target_device is not None:
+            self.cap_embedder.to("cpu")
+            
+        cap_feats[torch.cat(cap_inner_pad_mask).to(device)] = self.cap_pad_token.to(device)
         cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
+        
+        cap_rope_ids = torch.cat(cap_pos_ids, dim=0).to(device)
         cap_freqs_cis = list(
-            self.rope_embedder(torch.cat(cap_pos_ids, dim=0)).split([len(_) for _ in cap_pos_ids], dim=0)
+            self.rope_embedder(cap_rope_ids).split([len(_) for _ in cap_pos_ids], dim=0)
         )
 
         cap_feats = pad_sequence(cap_feats, batch_first=True, padding_value=0.0)
@@ -542,7 +584,12 @@ class ZImageTransformer2DModel(nn.Module):
             cap_attn_mask[i, :seq_len] = 1
 
         for layer in self.context_refiner:
+            if offload_layers and target_device is not None:
+                layer.to(device)
             cap_feats = layer(cap_feats, cap_attn_mask, cap_freqs_cis)
+            if offload_layers and target_device is not None:
+                layer.to("cpu")
+                torch.cuda.empty_cache()
 
         unified = []
         unified_freqs_cis = []
@@ -562,9 +609,22 @@ class ZImageTransformer2DModel(nn.Module):
             unified_attn_mask[i, :seq_len] = 1
 
         for layer in self.layers:
+            if offload_layers and target_device is not None:
+                layer.to(device)
             unified = layer(unified, unified_attn_mask, unified_freqs_cis, adaln_input)
+            if offload_layers and target_device is not None:
+                layer.to("cpu")
+                torch.cuda.empty_cache()
 
-        unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, adaln_input)
+        final_layer_key = f"{patch_size}-{f_patch_size}"
+        if offload_layers and target_device is not None:
+            self.all_final_layer[final_layer_key].to(device)
+            
+        unified = self.all_final_layer[final_layer_key](unified, adaln_input)
+        
+        if offload_layers and target_device is not None:
+            self.all_final_layer[final_layer_key].to("cpu")
+            
         unified = list(unified.unbind(dim=0))
         x = self.unpatchify(unified, x_size, patch_size, f_patch_size)
 
