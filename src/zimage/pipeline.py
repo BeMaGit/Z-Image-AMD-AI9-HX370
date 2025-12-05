@@ -81,6 +81,7 @@ def generate(
     cfg_normalization: bool = False,
     cfg_truncation: float = DEFAULT_CFG_TRUNCATION,
     max_sequence_length: int = DEFAULT_MAX_SEQUENCE_LENGTH,
+    output_type: str = "pil",
     device: Optional[Union[str, torch.device]] = None,
     sequential_offload: bool = False,
     force_text_encoder_cpu: bool = False,
